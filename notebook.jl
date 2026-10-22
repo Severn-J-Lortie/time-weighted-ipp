@@ -28,7 +28,8 @@ struct SearchNode
     coords::Coords
     path::Vector{Coords}
     posterior::AbstractGPs.PosteriorGP
-    remaining_variance::Float32
+    remaining_variance::Float64
+    score::Float64
 end
 
 # ╔═╡ ad715bbf-0180-4890-98f2-162a6d05a98d
@@ -100,7 +101,8 @@ begin
 end
 
 # ╔═╡ 9eb0601e-782b-46df-a799-8a524189de36
-# Demonstration of time-weighted variance reduction. We will construct a loop, with clockwise traversal gaining information sooner. Terminal MI will be the same for both directions, but time-weighted will be able to distinguish
+# Counterclockwise traversal gains information sooner. Both directions finish
+# with the same posterior, but summed remaining variance distinguishes them (lower is better).
 begin
 	# Loop points
 	path = [(x = 3, y = 3),
@@ -116,7 +118,7 @@ begin
 			(x = 3, y = 5),
 			(x = 3, y = 4),
 			(x = 3, y = 3)]
-	# Clockwise traversal
+	# Counterclockwise traversal
 	f_p = init_f_p
 	time_weighted_objective = 0
 	for coords in path
@@ -124,9 +126,11 @@ begin
 		global f_p = condition_gp_on_point(f_p, coords)
 		global time_weighted_objective += gp_variance(f_p)
 	end
-	@printf("The result of traversing the loop clockwise is %.2f\n", time_weighted_objective)
+	ccw_score = time_weighted_objective
+	ccw_final_variance = gp_variance(f_p)
+	@printf("The result of traversing the loop counterclockwise is %.2f\n", ccw_score)
 
-	# Anti-clockwise traversal
+	# Clockwise traversal
 	f_p = init_f_p
 	time_weighted_objective = 0
 	for coords in reverse(path)
@@ -134,7 +138,167 @@ begin
 		global f_p = condition_gp_on_point(f_p, coords)
 		global time_weighted_objective += gp_variance(f_p)
 	end
-	@printf("The result of traversing the loop anti-clockwise is %.2f\n", time_weighted_objective)
+	cw_score = time_weighted_objective
+	cw_final_variance = gp_variance(f_p)
+	@printf("The result of traversing the loop clockwise is %.2f\n", cw_score)
+end
+
+# ╔═╡ 5864bb25-ddb2-4f34-94c3-4ea691ba07d7
+let
+	panels = []
+	for (direction, route, score, final_variance) in (
+		("Counterclockwise", path, ccw_score, ccw_final_variance),
+		("Clockwise", reverse(path), cw_score, cw_final_variance),
+	)
+		p = plot_gp_var(init_f_p(X))
+		plot!(p; aspect_ratio=:equal, xlabel="x", ylabel="y",
+			colorbar_title="Initial posterior variance",
+			title=@sprintf("%s\nTime-weighted: %.2f | Final variance: %.2f", direction, score, final_variance),
+			titlefontsize=10, legend=:topleft)
+		xs = getproperty.(route, :x)
+		ys = getproperty.(route, :y)
+		quiver!(p, xs[1:end-1], ys[1:end-1];
+			quiver=(diff(xs), diff(ys)), color=:white, linewidth=2, label=false)
+		scatter!(p, [xs[1]], [ys[1]];
+			color=:white, marker=:circle, markersize=5, label="Start / end")
+		push!(panels, p)
+	end
+	plot(panels...; layout=(1, 2), size=(1000, 450),
+		plot_title="Loop traversal")
+end
+
+# ╔═╡ 72d4743f-43b7-44ce-a596-b3c3bbfb368e
+# Budget counts moves. Measure each location once, including the start.
+# Time-weighted scores include every move, even when revisiting a location.
+function exhaustive_search(start::Coords, initial_posterior, measured_locations, budget::Int;
+                           objective=:time_weighted)
+	budget >= 0 || throw(ArgumentError("budget must be nonnegative"))
+	objective in (:time_weighted, :terminal) || throw(ArgumentError("unknown objective"))
+	(0 <= start.x < world_size && 0 <= start.y < world_size) ||
+		throw(ArgumentError("start must be in bounds"))
+
+	gp = start in measured_locations ? initial_posterior : condition_gp_on_point(initial_posterior, start)
+	variance = gp_variance(gp)
+	stack = Stack{SearchNode}()
+	push!(stack, SearchNode(start, [start], gp, variance,
+		objective == :time_weighted ? 0.0 : variance))
+	best = nothing
+
+	while !isempty(stack)
+		node = pop!(stack)
+		if length(node.path) - 1 == budget
+			if best === nothing || node.score < best.score
+				best = node
+			end
+			continue
+		end
+
+		for coords in get_valid_neighbors(node.coords)
+			gp = node.posterior
+			variance = node.remaining_variance
+			if !(coords in measured_locations || coords in node.path)
+				gp = condition_gp_on_point(gp, coords)
+				variance = gp_variance(gp)
+			end
+			score = objective == :time_weighted ? node.score + variance : variance
+			push!(stack, SearchNode(coords, [node.path; coords], gp, variance, score))
+		end
+	end
+	return best
+end
+
+# ╔═╡ 4aa38349-60cb-4ad5-88db-7e2da16b141a
+# Optimistically collect every reachable measurement immediately.
+function remaining_cost_bound(node::SearchNode, measured_locations, moves_left::Int)
+	moves_left == 0 && return 0.0
+	points = [[x, y] for x in x_env for y in y_env
+		if abs(x - node.coords.x) + abs(y - node.coords.y) <= moves_left &&
+		   !((x=x, y=y) in measured_locations || (x=x, y=y) in node.path)]
+	isempty(points) && return moves_left * node.remaining_variance
+	optimistic_gp = posterior(node.posterior(hcat(points...), noise_var), zeros(length(points)))
+	return moves_left * gp_variance(optimistic_gp)
+end
+
+# ╔═╡ e04815be-a3a3-4d12-928b-abdc192ea1b4
+function astar_search(start::Coords, initial_posterior, measured_locations, budget::Int)
+	budget >= 0 || throw(ArgumentError("budget must be nonnegative"))
+	(0 <= start.x < world_size && 0 <= start.y < world_size) ||
+		throw(ArgumentError("start must be in bounds"))
+	gp = start in measured_locations ? initial_posterior : condition_gp_on_point(initial_posterior, start)
+	root = SearchNode(start, [start], gp, gp_variance(gp), 0.0)
+	frontier = PriorityQueue{SearchNode, Float64}()
+	frontier[root] = remaining_cost_bound(root, measured_locations, budget)
+
+	while !isempty(frontier)
+		node = first(popfirst!(frontier))
+		moves_left = budget - (length(node.path) - 1)
+		moves_left == 0 && return node
+		for coords in get_valid_neighbors(node.coords)
+			gp = node.posterior
+			variance = node.remaining_variance
+			if !(coords in measured_locations || coords in node.path)
+				gp = condition_gp_on_point(gp, coords)
+				variance = gp_variance(gp)
+			end
+			child = SearchNode(coords, [node.path; coords], gp, variance, node.score + variance)
+			frontier[child] = child.score + remaining_cost_bound(child, measured_locations, moves_left - 1)
+		end
+	end
+	return nothing
+end
+
+# ╔═╡ 974a3235-7ebc-4a24-bb42-969e25e93bb3
+begin
+	# This start gives different optimal paths for the two objectives.
+	search_start = (x=2, y=2)
+	# A longer horizon makes A* pruning worth the heuristic cost.
+	search_budget = 9
+	measured_locations = [Coords((point[1], point[2])) for point in eachcol(initial_measurements)]
+	# Warm up both implementations before timing, to exclude first-call compilation.
+	exhaustive_search(search_start, init_f_p, measured_locations, search_budget)
+	astar_search(search_start, init_f_p, measured_locations, search_budget)
+	brute_force_run = @timed exhaustive_search(search_start, init_f_p, measured_locations, search_budget)
+	astar_run = @timed astar_search(search_start, init_f_p, measured_locations, search_budget)
+	time_weighted_result = brute_force_run.value
+	astar_result = astar_run.value
+	@assert isapprox(astar_result.score, time_weighted_result.score)
+	@printf("Time-weighted brute-force search: %.4f seconds\n", brute_force_run.time)
+	@printf("Time-weighted A* search: %.4f seconds\n", astar_run.time)
+	terminal_result = exhaustive_search(search_start, init_f_p, measured_locations, search_budget;
+		objective=:terminal)
+	@printf("Time-weighted search terminal variance reduction: %.2f\n",
+		gp_variance(init_f_p) - time_weighted_result.remaining_variance)
+	@printf("Terminal search terminal variance reduction: %.2f\n",
+		gp_variance(init_f_p) - terminal_result.remaining_variance)
+	@printf("A* search terminal variance reduction: %.2f\n",
+		gp_variance(init_f_p) - astar_result.remaining_variance)
+	(astar=(path=astar_result.path, score=astar_result.score),
+	 time_weighted=(path=time_weighted_result.path, score=time_weighted_result.score),
+	 terminal=(path=terminal_result.path, score=terminal_result.score))
+end
+
+# ╔═╡ b11d93a0-c39b-49b9-a3bd-57807525763f
+let
+	panels = []
+	for (name, result) in (("Time-weighted DFS", time_weighted_result),
+		("Time-weighted A*", astar_result), ("Terminal DFS", terminal_result))
+		p = plot_gp_var(result.posterior(X))
+		plot!(p; aspect_ratio=:equal, xlabel="x", ylabel="y",
+			title=name, colorbar_title="Final posterior variance", legend=:topleft)
+		xs = getproperty.(result.path, :x)
+		ys = getproperty.(result.path, :y)
+		if length(result.path) > 1
+			quiver!(p, xs[1:end-1], ys[1:end-1];
+				quiver=(diff(xs), diff(ys)), color=:white, linewidth=2, label=false)
+		end
+		scatter!(p, initial_measurements[1, :], initial_measurements[2, :];
+			marker=:xcross, color=:red, markersize=7, label="Initial measurements")
+		new_measurements = setdiff(unique(result.path), measured_locations)
+		scatter!(p, getproperty.(new_measurements, :x), getproperty.(new_measurements, :y);
+			color=:white, markersize=4, label="New measurements")
+		push!(panels, p)
+	end
+	plot(panels...; layout=(1, 3), size=(1500, 450), plot_title="Search paths")
 end
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
@@ -1621,5 +1785,11 @@ uuid = "23338594-aafe-5451-b93e-139f81909106"
 # ╠═a3774dea-309f-4324-a48b-b2e731a20d40
 # ╠═24bc6d3a-6c1a-43b1-af1a-120db3f24d08
 # ╠═9eb0601e-782b-46df-a799-8a524189de36
+# ╠═5864bb25-ddb2-4f34-94c3-4ea691ba07d7
+# ╠═72d4743f-43b7-44ce-a596-b3c3bbfb368e
+# ╠═4aa38349-60cb-4ad5-88db-7e2da16b141a
+# ╠═e04815be-a3a3-4d12-928b-abdc192ea1b4
+# ╠═974a3235-7ebc-4a24-bb42-969e25e93bb3
+# ╠═b11d93a0-c39b-49b9-a3bd-57807525763f
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
