@@ -168,8 +168,6 @@ let
 end
 
 # ╔═╡ 72d4743f-43b7-44ce-a596-b3c3bbfb368e
-# Budget counts moves. Measure each location once, including the start.
-# Time-weighted scores include every move, even when revisiting a location.
 function exhaustive_search(start::Coords, initial_posterior, measured_locations, budget::Int;
                            objective=:time_weighted)
 	budget >= 0 || throw(ArgumentError("budget must be nonnegative"))
@@ -208,7 +206,6 @@ function exhaustive_search(start::Coords, initial_posterior, measured_locations,
 end
 
 # ╔═╡ 4aa38349-60cb-4ad5-88db-7e2da16b141a
-# Optimistically collect every reachable measurement immediately.
 function remaining_cost_bound(node::SearchNode, measured_locations, moves_left::Int)
 	moves_left == 0 && return 0.0
 	points = [[x, y] for x in x_env for y in y_env
@@ -249,9 +246,7 @@ end
 
 # ╔═╡ 974a3235-7ebc-4a24-bb42-969e25e93bb3
 begin
-	# This start gives different optimal paths for the two objectives.
 	search_start = (x=2, y=2)
-	# A longer horizon makes A* pruning worth the heuristic cost.
 	search_budget = 9
 	measured_locations = [Coords((point[1], point[2])) for point in eachcol(initial_measurements)]
 	# Warm up both implementations before timing, to exclude first-call compilation.
